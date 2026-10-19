@@ -1,0 +1,122 @@
+import { connect } from 'cloudflare:sockets';
+
+export default {
+  async fetch(request, env, ctx) {
+    // UUID ကို Environment Variable ကနေ ယူပါ
+    const userID = env.UUID || '12345678-1234-1234-1234-123456789012';
+    
+    // WebSocket Upgrade Request ဟုတ်မဟုတ် စစ်ပါ
+    const upgradeHeader = request.headers.get('Upgrade');
+    if (!upgradeHeader || upgradeHeader !== 'websocket') {
+      return new Response('Expected WebSocket', { status: 426 });
+    }
+
+    const webSocketPair = new WebSocketPair();
+    const [client, server] = Object.values(webSocketPair);
+
+    server.accept({ allowHalfOpen: true });
+
+    let isConnected = false;
+    let tcpSocket = null;
+
+    server.addEventListener('message', async (event) => {
+      const data = event.data;
+      
+      if (!isConnected) {
+        // --- VLESS Header ကို ဖတ်ခြင်း ---
+        // ပထမဆုံး Message မှာ VLESS Header ပါဝင်ပါတယ်
+        if (data.byteLength < 24) {
+          server.close(1003, 'Invalid VLESS header');
+          return;
+        }
+
+        const version = new Uint8Array(data.slice(0, 1))[0];
+        if (version !== 0) {
+          server.close(1003, 'Invalid version');
+          return;
+        }
+
+        // UUID စစ်ဆေးခြင်း (ရိုးရှင်းစွာ)
+        const uuidBytes = new Uint8Array(data.slice(1, 17));
+        // (ဒီနေရာမှာ UUID ကို သေချာစစ်ဖို့ လိုပါတယ်)
+        
+        // Target Address နဲ့ Port ကို ဖတ်ခြင်း
+        const addrType = new Uint8Array(data.slice(17, 18))[0];
+        let addrLength = 0;
+        let addrStart = 18;
+        
+        if (addrType === 1) { // IPv4
+          addrLength = 4;
+        } else if (addrType === 2) { // Domain
+          addrLength = new Uint8Array(data.slice(18, 19))[0];
+          addrStart = 19;
+        } else if (addrType === 3) { // IPv6
+          addrLength = 16;
+        } else {
+          server.close(1003, 'Invalid address type');
+          return;
+        }
+
+        const addrBytes = new Uint8Array(data.slice(addrStart, addrStart + addrLength));
+        let targetAddress;
+        if (addrType === 2) {
+          targetAddress = new TextDecoder().decode(addrBytes);
+        } else if (addrType === 1) {
+          targetAddress = addrBytes.join('.');
+        } else {
+          // IPv6
+          targetAddress = [...addrBytes].map(b => b.toString(16).padStart(2, '0')).join(':');
+        }
+
+        const portStart = addrStart + addrLength;
+        const targetPort = new DataView(data.slice(portStart, portStart + 2)).getUint16(0);
+
+        // ကျန်တဲ့ Data (Early Data)
+        const earlyData = data.slice(portStart + 2);
+
+        // Target ဆီ ချိတ်ဆက်ပါ
+        try {
+          tcpSocket = connect({ hostname: targetAddress, port: targetPort });
+          
+          // Response ကို Client ဆီ ပို့ပါ
+          const writer = tcpSocket.writable.getWriter();
+          if (earlyData.byteLength > 0) {
+            await writer.write(earlyData);
+          }
+          writer.releaseLock();
+
+          tcpSocket.readable.pipeTo(new WritableStream({
+            write(chunk) {
+              server.send(chunk);
+            }
+          }));
+
+          isConnected = true;
+          
+          // နောက်ထပ် Data တွေကို Target ဆီ ပို့ပါ
+          server.addEventListener('message', async (e) => {
+            if (tcpSocket && isConnected) {
+              const writer = tcpSocket.writable.getWriter();
+              await writer.write(e.data);
+              writer.releaseLock();
+            }
+          });
+
+        } catch (err) {
+          server.close(1011, 'Connection failed');
+        }
+      }
+    });
+
+    server.addEventListener('close', () => {
+      if (tcpSocket) {
+        tcpSocket.close();
+      }
+    });
+
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+    });
+  },
+};
